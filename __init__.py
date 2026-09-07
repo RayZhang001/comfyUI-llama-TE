@@ -21,7 +21,7 @@ NODE_CLASS_MAPPINGS = {
     "QwenTE_ModelLoader": QwenTE模型加载器,
     "QwenTE_ImageInfer": QwenTE图像推理,
     "QwenTE_Unload": QwenTE卸载模型,
-    "QwenTE_MultiTurnChat": QwenTE多轮对话聊天,
+    "QwenTE_MultiTurnChat": QwenTE多轮对话,
     "QwenTE_ChatSettings": QwenTE对话增强设置,
     "QwenTE_SkillLoader": QwenTESkill加载器,
     "Gemma4TE_ModelLoader": Gemma4TE模型加载器,
