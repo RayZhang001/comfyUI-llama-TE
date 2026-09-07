@@ -1,29 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Local performance tuning and diagnostics for the Qwen llama.cpp backend.
-
-This keeps the upstream node implementation intact while making Qwen model
-construction match the known-good standalone llama.cpp settings used on the
-RTX 3090 test system:
-
-- n_batch=2048
-- n_ubatch=512
-- n_threads=8
-- n_threads_batch=16
-- honor the existing Qwen Flash Attention selector
-
-It also adds an English-only "Verbose Logging" toggle to the Qwen model loader.
-When enabled, important backend settings and request metrics are printed to the
-ComfyUI console. Native llama.cpp info logging is also enabled for exact prompt
-and generation timing when supported by the installed llama-cpp-python build.
-
-Vision/MTP behavior is intentionally unchanged. In particular, the upstream
-node still disables its Python speculative path when an mmproj is loaded.
-"""
+"""Performance tuning and concise diagnostics for the Qwen llama.cpp backend."""
 
 from __future__ import annotations
 
 import inspect
-import os
 import time
 
 from . import nodes as _nodes
@@ -41,6 +21,25 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
     _PENDING_VERBOSE = None
     _ACTIVE_REQUEST_VERBOSE = False
 
+    def _fmt_bool(value) -> str:
+        return "on" if bool(value) else "off"
+
+    def _fmt_seconds(seconds: float | None) -> str:
+        if seconds is None:
+            return "n/a"
+        return f"{seconds:.2f}s"
+
+    def _flash_label(config: dict) -> str:
+        try:
+            value = _nodes._解析flash_attention类型(config.get("flash_attn"))
+        except Exception:
+            return "unknown"
+        if value == 1:
+            return "on"
+        if value == 0:
+            return "off"
+        return "auto"
+
     @classmethod
     def _qwen_perf_input_types(cls):
         schema = _ORIGINAL_MODEL_LOADER_INPUT_TYPES()
@@ -49,8 +48,8 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             {
                 "default": False,
                 "tooltip": (
-                    "Print effective Qwen backend settings and per-request timing/token "
-                    "metrics to the ComfyUI console. Also enables llama.cpp info-level logs."
+                    "Print concise Qwen VRAM, model-load, request, generation, and total "
+                    "timing metrics to the ComfyUI console."
                 ),
             },
         )
@@ -75,49 +74,22 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             def __init__(self, *args, **kwargs):
                 config = _ACTIVE_QWEN_CONFIG
                 if config is not None:
-                    # Pin the same execution parameters as the known-good
-                    # standalone llama-server command instead of relying on
-                    # wrapper defaults that can change between wheels.
                     kwargs.setdefault("n_batch", 2048)
                     kwargs.setdefault("n_ubatch", 512)
                     kwargs.setdefault("n_threads", 8)
                     kwargs.setdefault("n_threads_batch", 16)
 
-                    # The upstream Qwen loader stores the UI choice in config
-                    # but never forwards it to Llama(...). Preserve the UI's
-                    # existing three-state behavior without adding new labels.
                     flash_attn_type = _nodes._解析flash_attention类型(
                         config.get("flash_attn")
                     )
                     if flash_attn_type is not None:
                         kwargs["flash_attn_type"] = flash_attn_type
 
-                    verbose_logging = bool(config.get("_perf_verbose", False))
-                    if verbose_logging:
-                        # In the current JamePeng wrapper, verbosity takes
-                        # precedence over verbose=False and exposes native
-                        # llama.cpp prompt/eval timing lines.
-                        kwargs["verbosity"] = 3
-
-                        flash_text = (
-                            "enabled"
-                            if flash_attn_type == 1
-                            else "disabled"
-                            if flash_attn_type == 0
-                            else "backend default"
-                        )
-                        print(
-                            "[comfyUI-llama-TE verbose] Backend overrides: "
-                            "n_batch=2048, n_ubatch=512, n_threads=8, "
-                            f"n_threads_batch=16, flash_attn={flash_text}",
-                            flush=True,
-                        )
-
+                # Keep native llama.cpp logging quiet. The structured diagnostics
+                # below provide the metrics we actually need without metadata/tensor dumps.
+                kwargs.pop("verbosity", None)
                 super().__init__(*args, **kwargs)
 
-        # Feature checks in the upstream node introspect Llama.__init__.
-        # Preserve the original constructor signature so checks for speculative,
-        # KV cache types, checkpoints, and other optional parameters still work.
         _QwenPerfLlama.__init__.__signature__ = _ORIGINAL_LLAMA_INIT_SIGNATURE
         _nodes.Llama = _QwenPerfLlama
 
@@ -135,36 +107,29 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             _ACTIVE_QWEN_CONFIG = effective_config
             started = time.perf_counter()
 
-            if verbose_logging:
-                flash_mode = effective_config.get("flash_attn")
-                print(
-                    "[comfyUI-llama-TE verbose] Model config: "
-                    f"family={effective_config.get('family')}, "
-                    f"model={effective_config.get('model')}, "
-                    f"mmproj={effective_config.get('mmproj')}, "
-                    f"n_ctx={effective_config.get('n_ctx')}, "
-                    f"n_gpu_layers={effective_config.get('n_gpu_layers')}, "
-                    f"kv_k={effective_config.get('cache_type_k')}, "
-                    f"kv_v={effective_config.get('cache_type_v')}, "
-                    f"flash_attn_ui={flash_mode}, "
-                    f"mtp_requested={effective_config.get('mtp_enabled')}, "
-                    f"mtp_draft_tokens={effective_config.get('mtp_draft_tokens')}, "
-                    f"thinking={effective_config.get('think')}, "
-                    f"reasoning_effort={effective_config.get('reasoning_effort')}, "
-                    f"cache_hit={cache_hit}",
-                    flush=True,
-                )
-
             try:
                 model = _ORIGINAL_QWEN_LOAD(cls, effective_config)
             finally:
                 _ACTIVE_QWEN_CONFIG = previous
 
+            elapsed = time.perf_counter() - started
+            _nodes._qwen_diag_model_load_s = elapsed
+            _nodes._qwen_diag_model_load_at = time.perf_counter()
+            _nodes._qwen_diag_model_cache_hit = cache_hit
+
             if verbose_logging:
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                load_mode = effective_config.get("_load_mode", "auto")
+                lazy_mode = effective_config.get("_lazy_mode", "auto")
+                no_host = _fmt_bool(effective_config.get("_no_host", False))
                 print(
-                    "[comfyUI-llama-TE verbose] Model load: "
-                    f"wall_ms={elapsed_ms:.2f}, reused_cached_model={cache_hit}",
+                    "[QwenTE][LOAD] "
+                    f"{_fmt_seconds(elapsed)} | cached={_fmt_bool(cache_hit)} | "
+                    f"mode={load_mode} | lazy={lazy_mode} | no_host={no_host} | "
+                    f"ctx={effective_config.get('n_ctx')} | gpu_layers={effective_config.get('n_gpu_layers')} | "
+                    f"FA={_flash_label(effective_config)} | "
+                    f"KV={effective_config.get('cache_type_k')}/{effective_config.get('cache_type_v')} | "
+                    f"MTP={_fmt_bool(effective_config.get('mtp_enabled'))} | "
+                    f"thinking={_fmt_bool(effective_config.get('think'))}",
                     flush=True,
                 )
 
@@ -189,13 +154,11 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
 
         image_count = _count_message_images(messages)
         print(
-            "[comfyUI-llama-TE verbose] Completion request: "
-            f"images={image_count}, max_tokens={params.get('max_tokens')}, "
-            f"temperature={params.get('temperature')}, top_p={params.get('top_p')}, "
-            f"top_k={params.get('top_k')}, min_p={params.get('min_p')}, "
-            f"repeat_penalty={params.get('repeat_penalty')}, "
-            f"frequency_penalty={params.get('frequency_penalty')}, "
-            f"presence_penalty={params.get('presence_penalty')}, seed={params.get('seed')}",
+            "[QwenTE][REQUEST] "
+            f"images={image_count} | max_out={params.get('max_tokens')} | "
+            f"temp={params.get('temperature')} | top_p={params.get('top_p')} | "
+            f"top_k={params.get('top_k')} | min_p={params.get('min_p')} | "
+            f"seed={params.get('seed')}",
             flush=True,
         )
 
@@ -209,34 +172,33 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
         completion_tokens = usage.get("completion_tokens")
         total_tokens = usage.get("total_tokens")
 
+        output_rate = None
         if completion_tokens is not None and elapsed > 0:
-            output_per_wall_second = float(completion_tokens) / elapsed
-            output_rate_text = f"{output_per_wall_second:.2f}"
-        else:
-            output_rate_text = "n/a"
+            output_rate = float(completion_tokens) / elapsed
 
-        metric_parts = [
-            f"wall_ms={elapsed * 1000.0:.2f}",
-            f"prompt_tokens={prompt_tokens if prompt_tokens is not None else 'n/a'}",
-            f"completion_tokens={completion_tokens if completion_tokens is not None else 'n/a'}",
-            f"total_tokens={total_tokens if total_tokens is not None else 'n/a'}",
-            f"completion_tokens_per_wall_s={output_rate_text}",
+        _nodes._qwen_diag_generation_s = elapsed
+        _nodes._qwen_diag_prompt_tokens = prompt_tokens
+        _nodes._qwen_diag_completion_tokens = completion_tokens
+        _nodes._qwen_diag_total_tokens = total_tokens
+        _nodes._qwen_diag_output_wall_tps = output_rate
+
+        parts = [
+            f"{_fmt_seconds(elapsed)}",
+            f"prompt={prompt_tokens if prompt_tokens is not None else 'n/a'} tok",
+            f"output={completion_tokens if completion_tokens is not None else 'n/a'} tok",
         ]
+        if output_rate is not None:
+            parts.append(f"wall_out={output_rate:.1f} tok/s")
 
         if isinstance(timings, dict) and timings:
-            for key in (
-                "prompt_ms",
-                "prompt_per_second",
-                "predicted_ms",
-                "predicted_per_second",
-            ):
-                if key in timings:
-                    metric_parts.append(f"{key}={timings[key]}")
+            prompt_rate = timings.get("prompt_per_second")
+            predicted_rate = timings.get("predicted_per_second")
+            if prompt_rate is not None:
+                parts.append(f"prefill={float(prompt_rate):.1f} tok/s")
+            if predicted_rate is not None:
+                parts.append(f"decode={float(predicted_rate):.1f} tok/s")
 
-        print(
-            "[comfyUI-llama-TE verbose] Completion metrics: " + ", ".join(metric_parts),
-            flush=True,
-        )
+        print("[QwenTE][GEN] " + " | ".join(parts), flush=True)
         return result
 
     _nodes._调用chat_completion = _qwen_perf_chat_completion
@@ -285,10 +247,9 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
                         primary_frames = 0
 
             print(
-                "[comfyUI-llama-TE verbose] Inference start: "
-                f"input_mode={input_mode}, image_inputs={image_inputs}, "
-                f"primary_frames={primary_frames}, max_edge={max_edge}, "
-                f"max_tokens={max_tokens}, auto_unload={bool(auto_unload)}",
+                "[QwenTE][RUN] "
+                f"mode={input_mode} | image_inputs={image_inputs} | frames={primary_frames} | "
+                f"max_edge={max_edge} | max_out={max_tokens} | auto_unload={_fmt_bool(auto_unload)}",
                 flush=True,
             )
 
@@ -296,11 +257,18 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             return _ORIGINAL_INFER_RUN(self, *args, **kwargs)
         finally:
             if verbose_logging:
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                print(
-                    f"[comfyUI-llama-TE verbose] Inference end: wall_ms={elapsed_ms:.2f}",
-                    flush=True,
-                )
+                elapsed = time.perf_counter() - started
+                load_s = getattr(_nodes, "_qwen_diag_model_load_s", None)
+                cleanup_s = getattr(_nodes, "_qwen_diag_vram_cleanup_s", None)
+                gen_s = getattr(_nodes, "_qwen_diag_generation_s", None)
+                summary = [f"total={_fmt_seconds(elapsed)}"]
+                if cleanup_s is not None:
+                    summary.append(f"vram_cleanup={_fmt_seconds(cleanup_s)}")
+                if load_s is not None:
+                    summary.append(f"model_load={_fmt_seconds(load_s)}")
+                if gen_s is not None:
+                    summary.append(f"generation={_fmt_seconds(gen_s)}")
+                print("[QwenTE][TOTAL] " + " | ".join(summary), flush=True)
             _ACTIVE_REQUEST_VERBOSE = previous
 
     _nodes.QwenTE图像推理.run = _qwen_perf_infer_run
