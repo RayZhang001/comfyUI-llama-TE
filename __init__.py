@@ -13,6 +13,7 @@ from .nodes import (
     Gemma4TE卸载模型,
 )
 from . import qwen_perf_patch as _qwen_perf_patch
+from . import qwen_vram_patch as _qwen_vram_patch
 from .multi_turn_chat import QwenTE多轮对话, QwenTE对话增强设置
 from .skill_loader import QwenTESkill加载器
 
@@ -20,7 +21,7 @@ NODE_CLASS_MAPPINGS = {
     "QwenTE_ModelLoader": QwenTE模型加载器,
     "QwenTE_ImageInfer": QwenTE图像推理,
     "QwenTE_Unload": QwenTE卸载模型,
-    "QwenTE_MultiTurnChat": QwenTE多轮对话,
+    "QwenTE_MultiTurnChat": QwenTE多轮对话聊天,
     "QwenTE_ChatSettings": QwenTE对话增强设置,
     "QwenTE_SkillLoader": QwenTESkill加载器,
     "Gemma4TE_ModelLoader": Gemma4TE模型加载器,
