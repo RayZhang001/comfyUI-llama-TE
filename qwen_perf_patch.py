@@ -12,6 +12,7 @@ from . import nodes as _nodes
 if not getattr(_nodes, "_qwen_perf_patch_installed", False):
     _ORIGINAL_LLAMA = _nodes.Llama
     _ORIGINAL_QWEN_LOAD = _nodes._QwenStorage.load.__func__
+    _ORIGINAL_QWEN_UNLOAD = _nodes._QwenStorage.unload.__func__
     _ORIGINAL_MODEL_LOADER_INPUT_TYPES = _nodes.QwenTE模型加载器.INPUT_TYPES
     _ORIGINAL_MODEL_LOADER_LOAD = _nodes.QwenTE模型加载器.__dict__["load"]
     _ORIGINAL_INFER_RUN = _nodes.QwenTE图像推理.__dict__["run"]
@@ -48,8 +49,8 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             {
                 "default": False,
                 "tooltip": (
-                    "Print concise Qwen VRAM, model-load, request, generation, and total "
-                    "timing metrics to the ComfyUI console."
+                    "Print concise Qwen VRAM, cold-load stage, request, generation, unload, "
+                    "and end-to-end timing metrics to the ComfyUI console."
                 ),
             },
         )
@@ -85,8 +86,8 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
                     if flash_attn_type is not None:
                         kwargs["flash_attn_type"] = flash_attn_type
 
-                # Keep native llama.cpp logging quiet. The structured diagnostics
-                # below provide the metrics we actually need without metadata/tensor dumps.
+                # Keep native llama.cpp logging quiet. Structured diagnostics below
+                # provide the metrics we need without metadata/tensor dumps.
                 kwargs.pop("verbosity", None)
                 super().__init__(*args, **kwargs)
 
@@ -121,21 +122,59 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
                 load_mode = effective_config.get("_load_mode", "auto")
                 lazy_mode = effective_config.get("_lazy_mode", "auto")
                 no_host = _fmt_bool(effective_config.get("_no_host", False))
-                print(
-                    "[QwenTE][LOAD] "
-                    f"{_fmt_seconds(elapsed)} | cached={_fmt_bool(cache_hit)} | "
-                    f"mode={load_mode} | lazy={lazy_mode} | no_host={no_host} | "
-                    f"ctx={effective_config.get('n_ctx')} | gpu_layers={effective_config.get('n_gpu_layers')} | "
-                    f"FA={_flash_label(effective_config)} | "
-                    f"KV={effective_config.get('cache_type_k')}/{effective_config.get('cache_type_v')} | "
-                    f"MTP={_fmt_bool(effective_config.get('mtp_enabled'))} | "
-                    f"thinking={_fmt_bool(effective_config.get('think'))}",
-                    flush=True,
+                model_stage = getattr(_nodes, "_qwen_diag_llama_init_s", None)
+                vision_stage = getattr(_nodes, "_qwen_diag_mmproj_s", None)
+                known_stage = sum(
+                    value for value in (model_stage, vision_stage) if isinstance(value, (int, float))
                 )
+                overhead = max(0.0, elapsed - known_stage) if known_stage else None
+
+                parts = [
+                    f"total={_fmt_seconds(elapsed)}",
+                    f"cached={_fmt_bool(cache_hit)}",
+                    f"mode={load_mode}",
+                    f"lazy={lazy_mode}",
+                    f"no_host={no_host}",
+                ]
+                if model_stage is not None:
+                    parts.append(f"model={_fmt_seconds(model_stage)}")
+                if vision_stage is not None:
+                    parts.append(f"vision={_fmt_seconds(vision_stage)}")
+                if overhead is not None:
+                    parts.append(f"other={_fmt_seconds(overhead)}")
+                parts.extend(
+                    [
+                        f"ctx={effective_config.get('n_ctx')}",
+                        f"gpu_layers={effective_config.get('n_gpu_layers')}",
+                        f"FA={_flash_label(effective_config)}",
+                        f"KV={effective_config.get('cache_type_k')}/{effective_config.get('cache_type_v')}",
+                        f"MTP={_fmt_bool(effective_config.get('mtp_enabled'))}",
+                        f"thinking={_fmt_bool(effective_config.get('think'))}",
+                    ]
+                )
+                print("[QwenTE][LOAD] " + " | ".join(parts), flush=True)
 
             return model
 
         _nodes._QwenStorage.load = _qwen_perf_load
+
+    @classmethod
+    def _qwen_perf_unload(cls):
+        settings = getattr(getattr(cls, "model", None), "settings", {}) or {}
+        verbose_logging = _ACTIVE_REQUEST_VERBOSE or bool(settings.get("_perf_verbose", False))
+        had_model = getattr(cls, "model", None) is not None
+        started = time.perf_counter()
+        try:
+            return _ORIGINAL_QWEN_UNLOAD(cls)
+        finally:
+            if had_model:
+                elapsed = time.perf_counter() - started
+                _nodes._qwen_diag_unload_s = elapsed
+                _nodes._qwen_diag_unload_at = time.perf_counter()
+                if verbose_logging:
+                    print(f"[QwenTE][UNLOAD] {_fmt_seconds(elapsed)} | llama.cpp close + cleanup", flush=True)
+
+    _nodes._QwenStorage.unload = _qwen_perf_unload
 
     def _count_message_images(messages) -> int:
         count = 0
@@ -188,7 +227,7 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             f"output={completion_tokens if completion_tokens is not None else 'n/a'} tok",
         ]
         if output_rate is not None:
-            parts.append(f"wall_out={output_rate:.1f} tok/s")
+            parts.append(f"output/wall={output_rate:.1f} tok/s")
 
         if isinstance(timings, dict) and timings:
             prompt_rate = timings.get("prompt_per_second")
@@ -226,6 +265,9 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
         previous = _ACTIVE_REQUEST_VERBOSE
         _ACTIVE_REQUEST_VERBOSE = verbose_logging
         started = time.perf_counter()
+        _nodes._qwen_diag_infer_started_at = started
+        _nodes._qwen_diag_generation_s = None
+        _nodes._qwen_diag_unload_s = None
 
         if verbose_logging and bound is not None:
             input_mode = _bound_value(bound, 2)
@@ -257,17 +299,43 @@ if not getattr(_nodes, "_qwen_perf_patch_installed", False):
             return _ORIGINAL_INFER_RUN(self, *args, **kwargs)
         finally:
             if verbose_logging:
-                elapsed = time.perf_counter() - started
+                infer_elapsed = time.perf_counter() - started
                 load_s = getattr(_nodes, "_qwen_diag_model_load_s", None)
+                load_at = getattr(_nodes, "_qwen_diag_model_load_at", None)
                 cleanup_s = getattr(_nodes, "_qwen_diag_vram_cleanup_s", None)
                 gen_s = getattr(_nodes, "_qwen_diag_generation_s", None)
-                summary = [f"total={_fmt_seconds(elapsed)}"]
+                unload_s = getattr(_nodes, "_qwen_diag_unload_s", None)
+
+                load_in_run = isinstance(load_at, (int, float)) and load_at >= started
+                recent_preload = (
+                    isinstance(load_at, (int, float))
+                    and load_at < started
+                    and (started - load_at) <= 5.0
+                )
+
+                if load_in_run:
+                    pipeline_elapsed = infer_elapsed
+                elif recent_preload:
+                    pipeline_elapsed = infer_elapsed
+                    if isinstance(load_s, (int, float)):
+                        pipeline_elapsed += load_s
+                    if isinstance(cleanup_s, (int, float)):
+                        pipeline_elapsed += cleanup_s
+                else:
+                    pipeline_elapsed = None
+
+                summary = [f"infer={_fmt_seconds(infer_elapsed)}"]
+                if pipeline_elapsed is not None:
+                    summary.insert(0, f"pipeline={_fmt_seconds(pipeline_elapsed)}")
+                summary.append(f"load_in_run={_fmt_bool(load_in_run)}")
                 if cleanup_s is not None:
-                    summary.append(f"vram_cleanup={_fmt_seconds(cleanup_s)}")
+                    summary.append(f"vram={_fmt_seconds(cleanup_s)}")
                 if load_s is not None:
-                    summary.append(f"model_load={_fmt_seconds(load_s)}")
+                    summary.append(f"load={_fmt_seconds(load_s)}")
                 if gen_s is not None:
-                    summary.append(f"generation={_fmt_seconds(gen_s)}")
+                    summary.append(f"gen={_fmt_seconds(gen_s)}")
+                if unload_s is not None:
+                    summary.append(f"unload={_fmt_seconds(unload_s)}")
                 print("[QwenTE][TOTAL] " + " | ".join(summary), flush=True)
             _ACTIVE_REQUEST_VERBOSE = previous
 
