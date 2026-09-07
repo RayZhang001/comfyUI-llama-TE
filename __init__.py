@@ -12,6 +12,7 @@ from .nodes import (
     Gemma4TE音频推理,
     Gemma4TE卸载模型,
 )
+from . import qwen_perf_patch as _qwen_perf_patch
 from .multi_turn_chat import QwenTE多轮对话, QwenTE对话增强设置
 from .skill_loader import QwenTESkill加载器
 
