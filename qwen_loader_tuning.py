@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Experimental Qwen model-loading controls for cold-load benchmarking."""
+"""Experimental Qwen model-loading controls and cold-load stage diagnostics."""
 
 from __future__ import annotations
 
 import inspect
+import time
 
 from . import nodes as _nodes
 from . import qwen_perf_patch as _perf
@@ -19,6 +20,7 @@ if not getattr(_nodes, "_qwen_loader_tuning_installed", False):
     _PARENT_QWEN_LOAD = _nodes._QwenStorage.load.__func__
     _PARENT_MODEL_LOADER_INPUT_TYPES = _nodes.QwenTE模型加载器.INPUT_TYPES
     _PARENT_MODEL_LOADER_LOAD = _nodes.QwenTE模型加载器.__dict__["load"]
+    _PARENT_QWEN35_HANDLER = getattr(_nodes, "_创建qwen35聊天处理器", None)
 
     _PENDING_LOAD_MODE = None
     _PENDING_LAZY_MODE = None
@@ -117,6 +119,10 @@ if not getattr(_nodes, "_qwen_loader_tuning_installed", False):
         class _QwenLoaderTunedLlama(_PARENT_LLAMA):
             def __init__(self, *args, **kwargs):
                 config = getattr(_perf, "_ACTIVE_QWEN_CONFIG", None)
+                verbose_logging = bool(
+                    isinstance(config, dict) and config.get("_perf_verbose", False)
+                )
+
                 if isinstance(config, dict):
                     load_mode_name = str(config.get("_load_mode", "mmap"))
                     lazy_mode_name = str(config.get("_lazy_mode", "auto"))
@@ -135,10 +141,42 @@ if not getattr(_nodes, "_qwen_loader_tuning_installed", False):
                     )
                     kwargs["no_host"] = no_host
 
-                super().__init__(*args, **kwargs)
+                started = time.perf_counter()
+                try:
+                    super().__init__(*args, **kwargs)
+                finally:
+                    elapsed = time.perf_counter() - started
+                    _nodes._qwen_diag_llama_init_s = elapsed
+                    _nodes._qwen_diag_llama_init_at = time.perf_counter()
+                    if verbose_logging:
+                        print(
+                            f"[QwenTE][LOAD:MODEL] {elapsed:.2f}s | main GGUF + CUDA context/graphs",
+                            flush=True,
+                        )
 
         _QwenLoaderTunedLlama.__init__.__signature__ = _PARENT_LLAMA_SIGNATURE
         _nodes.Llama = _QwenLoaderTunedLlama
+
+    if _PARENT_QWEN35_HANDLER is not None:
+        def _qwen_timed_qwen35_handler(*args, **kwargs):
+            config = getattr(_perf, "_ACTIVE_QWEN_CONFIG", None)
+            verbose_logging = bool(
+                isinstance(config, dict) and config.get("_perf_verbose", False)
+            )
+            started = time.perf_counter()
+            try:
+                return _PARENT_QWEN35_HANDLER(*args, **kwargs)
+            finally:
+                elapsed = time.perf_counter() - started
+                _nodes._qwen_diag_mmproj_s = elapsed
+                _nodes._qwen_diag_mmproj_at = time.perf_counter()
+                if verbose_logging:
+                    print(
+                        f"[QwenTE][LOAD:VISION] {elapsed:.2f}s | mmproj / MTMD handler",
+                        flush=True,
+                    )
+
+        _nodes._创建qwen35聊天处理器 = _qwen_timed_qwen35_handler
 
     @classmethod
     def _qwen_loader_tuned_load(cls, config: dict):
@@ -158,6 +196,10 @@ if not getattr(_nodes, "_qwen_loader_tuning_installed", False):
             effective_config["_no_host"] = bool(_PENDING_NO_HOST)
         else:
             effective_config.setdefault("_no_host", False)
+
+        # Clear stage values so a failed or alternate load cannot display stale data.
+        _nodes._qwen_diag_llama_init_s = None
+        _nodes._qwen_diag_mmproj_s = None
 
         return _PARENT_QWEN_LOAD(cls, effective_config)
 
