@@ -14,6 +14,7 @@ from .nodes import (
 )
 from . import qwen_perf_patch as _qwen_perf_patch
 from . import qwen_vram_patch as _qwen_vram_patch
+from . import qwen_loader_tuning as _qwen_loader_tuning
 from .multi_turn_chat import QwenTE多轮对话, QwenTE对话增强设置
 from .skill_loader import QwenTESkill加载器
 
